@@ -6,9 +6,9 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import mkdtemp
-from typing import Optional
+from typing import Optional, Dict, Any, List, Callable, Awaitable
 
-import nodriver
+from playwright.async_api import async_playwright, Page, BrowserContext, Browser, Request
 
 logger = logging.getLogger('extractor')
 
@@ -25,6 +25,9 @@ class TokenInfo:
         return as_json
 
 
+TokenUpdateCallback = Callable[[TokenInfo], Awaitable[None]]
+
+
 class PotokenExtractor:
 
     def __init__(self, loop: asyncio.AbstractEventLoop,
@@ -32,12 +35,15 @@ class PotokenExtractor:
                  browser_path: Optional[Path] = None) -> None:
         self.update_interval: float = update_interval
         self.browser_path: Optional[Path] = browser_path
-        self.profile_path = mkdtemp()  # cleaned up on exit by nodriver
+        self.profile_path = mkdtemp()
         self._loop = loop
         self._token_info: Optional[TokenInfo] = None
         self._ongoing_update: asyncio.Lock = asyncio.Lock()
         self._extraction_done: asyncio.Event = asyncio.Event()
         self._update_requested: asyncio.Event = asyncio.Event()
+        self._playwright = None
+        self._browser = None
+        self._token_update_callbacks: List[TokenUpdateCallback] = []
 
     def get(self) -> Optional[TokenInfo]:
         return self._token_info
@@ -69,16 +75,49 @@ class PotokenExtractor:
         logger.debug('force update requested')
         return True
 
-    @staticmethod
-    def _extract_token(request: nodriver.cdp.network.Request) -> Optional[TokenInfo]:
-        post_data = request.post_data
+    async def register_token_update_callback(self, callback: TokenUpdateCallback) -> None:
+        """Register a callback to be called when token is updated"""
+        self._token_update_callbacks.append(callback)
+        logger.debug(f'Registered new token update callback, total: {len(self._token_update_callbacks)}')
+
+
+    async def unregister_token_update_callback(self, callback: TokenUpdateCallback) -> bool:
+        """
+        Unregister a previously registered callback
+        Returns True if callback was found and removed, False otherwise
+        """
+        if callback in self._token_update_callbacks:
+            self._token_update_callbacks.remove(callback)
+            logger.debug(f'Unregistered token update callback, remaining: {len(self._token_update_callbacks)}')
+            return True
+        return False
+
+
+    async def _notify_token_updated(self, token_info: TokenInfo) -> None:
+        """Notify all registered callbacks about token update"""
+        if not self._token_update_callbacks:
+            return
+
+        logger.debug(f'Notifying {len(self._token_update_callbacks)} callbacks about token update')
+
+        tasks = []
+        for callback in self._token_update_callbacks:
+            tasks.append(asyncio.create_task(callback(token_info)))
+
+        if tasks:
+            try:
+                await asyncio.gather(*tasks)
+            except Exception as e:
+                logger.error(f"Error in token update callback: {e}")
+
+    def _extract_token(self, request_data: Dict[str, Any]) -> Optional[TokenInfo]:
         try:
-            post_data_json = json.loads(post_data)
-            visitor_data = post_data_json['context']['client']['visitorData']
-            potoken = post_data_json['serviceIntegrityDimensions']['poToken']
-        except (json.JSONDecodeError, TypeError, KeyError) as e:
+            visitor_data = request_data['context']['client']['visitorData']
+            potoken = request_data['serviceIntegrityDimensions']['poToken']
+        except (TypeError, KeyError) as e:
             logger.warning(f'failed to extract token from request: {type(e)}, {e}')
             return None
+
         token_info = TokenInfo(
             updated=int(time.time()),
             potoken=potoken,
@@ -100,32 +139,82 @@ class PotokenExtractor:
         async with self._ongoing_update:
             logger.info('update started')
             self._extraction_done.clear()
-            try:
-                browser = await nodriver.start(headless=False,
-                                               browser_executable_path=self.browser_path,
-                                               user_data_dir=self.profile_path)
-            except FileNotFoundError as e:
-                msg = "could not find Chromium. Make sure it's installed or provide direct path to the executable"
-                raise FileNotFoundError(msg) from e
-            tab = browser.main_tab
-            tab.add_handler(nodriver.cdp.network.RequestWillBeSent, self._send_handler)
-            await tab.get('https://www.youtube.com/embed/jNQXAC9IVRw')
-            player_clicked = await self._click_on_player(tab)
-            if player_clicked:
-                await self._wait_for_handler()
-            await tab.close()
-            browser.stop()
+            old_token = self._token_info
 
-    @staticmethod
-    async def _click_on_player(tab: nodriver.Tab) -> bool:
+            try:
+                if self._playwright is None:
+                    self._playwright = await async_playwright().start()
+
+                browser_type = self._playwright.chromium
+                browser_args = {}
+
+                if self.browser_path:
+                    browser_args["executable_path"] = str(self.browser_path)
+
+                context = await browser_type.launch_persistent_context(
+                    user_data_dir=self.profile_path,
+                    headless=False,
+                    **browser_args
+                )
+
+                page = await context.new_page()
+
+                await self._setup_request_interception(page)
+
+                await page.goto('https://www.youtube.com/embed/jNQXAC9IVRw')
+
+                player_clicked = await self._click_on_player(page)
+
+                if player_clicked:
+                    extraction_success = await self._wait_for_handler()
+                    if not extraction_success:
+                        logger.warning("No token was extracted in the allotted time")
+
+                await page.close()
+                await context.close()
+
+                if self._token_info != old_token and self._token_info is not None:
+                    await self._notify_token_updated(self._token_info)
+
+            except Exception as e:
+                logger.error(f"Error during token extraction: {type(e).__name__}: {e}")
+                raise
+
+    async def _setup_request_interception(self, page: Page) -> None:
+        async def handle_request(request: Request):
+            if request.method == 'POST' and '/youtubei/v1/player' in request.url:
+                try:
+                    post_data_str = request.post_data
+                    if not post_data_str:
+                        return
+
+                    post_data = json.loads(post_data_str)
+                    token_info = self._extract_token(post_data)
+
+                    if token_info:
+                        logger.info(f'new token: {token_info.to_json()}')
+                        old_token = self._token_info
+                        self._token_info = token_info
+                        self._extraction_done.set()
+
+                        if old_token != token_info:
+                            asyncio.create_task(self._notify_token_updated(token_info))
+
+                except Exception as e:
+                    logger.warning(f"Error processing request: {e}")
+
+        page.on('request', handle_request)
+
+    async def _click_on_player(self, page: Page) -> bool:
         try:
-            player = await tab.select('#movie_player', 10)
-        except asyncio.TimeoutError:
-            logger.warning('update failed: unable to locate video player on the page')
+            player = await page.wait_for_selector('#movie_player', timeout=10000)
+            if player:
+                await player.click()
+                return True
             return False
-        else:
-            await player.click()
-            return True
+        except Exception as e:
+            logger.warning(f'update failed: unable to locate video player on the page: {e}')
+            return False
 
     async def _wait_for_handler(self) -> bool:
         try:
@@ -134,17 +223,10 @@ class PotokenExtractor:
             logger.warning('update failed: timeout waiting for outgoing API request')
             return False
         else:
-            logger.info('update was succeessful')
+            logger.info('update was successful')
             return True
 
-    async def _send_handler(self, event: nodriver.cdp.network.RequestWillBeSent) -> None:
-        if not event.request.method == 'POST':
-            return
-        if '/youtubei/v1/player' not in event.request.url:
-            return
-        token_info = self._extract_token(event.request)
-        if token_info is None:
-            return
-        logger.info(f'new token: {token_info.to_json()}')
-        self._token_info = token_info
-        self._extraction_done.set()
+    async def cleanup(self):
+        """Close resources when the application exits"""
+        if self._playwright:
+            await self._playwright.stop()
