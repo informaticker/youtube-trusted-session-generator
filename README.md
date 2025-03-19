@@ -9,6 +9,7 @@ this fork replaces the older nodriver-based chromium automation with playwright,
 1. switching from `nodriver` to `playwright`
 2. callback system for token updates
 3. the http server now waits for token updates
+4. i broke docker version and i cba'ed to fix it because i hate docker.
 
 the (web) server component was rewritten from a wsgi implementation to a more straightforward threaded http server.
 
